@@ -36,6 +36,7 @@ TITLE_OUTPUT = 'C O N F L U E N C E   D U M P E R  %s' % CONFLUENCE_DUMPER_VERSI
 class ConfluenceClient(object):
     def __init__(self, base_url):
         self.base_url = base_url
+        self.__cached_tinyurl = {}
 
     def get_page_details_by_page_id(self, page_id):
         response = self.request('/rest/api/content/%s?expand=children.page,children.attachment,body.view.value' % page_id)
@@ -47,6 +48,26 @@ class ConfluenceClient(object):
         if 'homepage' in response:
             homepage_id = response['homepage']['id']
         return response['name'], homepage_id
+
+    def get_page_id_by_tinyurl(self, tinyurl):
+        """ Convert from "/x/KuwCBw" to "/pages/viewpage.action?pageId=117632042" and extract id
+        :param tinyurl:
+        :return: corresponding page_id
+        """
+        hash_val = tinyurl.split('/')[-1]
+        if hash_val in self.__cached_tinyurl:
+            return self.__cached_tinyurl[hash_val]
+
+        page_id = None
+        for redirect_url in utils.http_get_iterate_redirect_url("{}/pages/tinyurl.action?urlIdentifier={}".format(self.base_url, hash_val)):
+            if 'pageId' in redirect_url:
+                queries = urllib_parse.parse_qs(urllib_parse.urlparse(redirect_url).query)
+                page_id = int(queries['pageId'][0]) if 'pageId' in queries else None
+                break
+
+        if page_id:
+            self.__cached_tinyurl[hash_val] = page_id
+        return page_id
 
     def iterate_child_pages_by_page_id(self, page_id):
         for page in self.iterate_page('/rest/api/content/%s/child/page?limit=25' % page_id):
@@ -203,6 +224,14 @@ def handle_html_references(html_tree, page_duplicate_file_names, page_file_match
             offline_link = provide_unique_file_name(page_duplicate_file_names, page_file_matching, decoded_page_title,
                                                     explicit_file_extension='html')
             link_element.attrib['href'] = utils.encode_url(offline_link)
+
+    xpath_expr = '//a[contains(@href, "/x/")]'
+    for link_element in html_tree.xpath(xpath_expr):
+        if not link_element.get('class'):
+            page_id = conf_client.get_page_id_by_tinyurl(link_element.attrib['href'])
+            print("%s\033[1;30;40mLINK - %s (-> %s)\033[m" % ('\t' * (depth + 1), link_element.attrib['href'], page_id))
+            if page_id:
+                link_element.attrib['href'] = urllib_parse.urljoin(link_element.attrib['href'], "/pages/viewpage.action?pageId=%s" % page_id)
 
     # Fix links to other Confluence pages when page ids are used
     xpath_expr = '//a[contains(@href, "/pages/viewpage.action?pageId=")]'

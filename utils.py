@@ -14,6 +14,7 @@ import requests
 import shutil
 import re
 import urllib
+from six.moves import urllib_parse
 
 
 class ConfluenceException(Exception):
@@ -37,8 +38,16 @@ def http_get(request_url, auth=None, headers=None, verify_peer_certificate=True,
     if 200 == response.status_code:
         return response.json()
     else:
-        raise ConfluenceException('Error %s: %s on requesting %s' % (response.status_code, response.reason,
-                                                                     request_url))
+        raise ConfluenceException('Error %s: %s on requesting %s' % (response.status_code, response.reason, request_url))
+
+
+def http_get_iterate_redirect_url(request_url, auth=None, headers=None, verify_peer_certificate=True, proxies=None):
+    while request_url:
+        response = requests.get(request_url, auth=auth, headers=headers, verify=verify_peer_certificate, proxies=proxies, allow_redirects=False)
+        if 302 == response.status_code:
+            yield urllib_parse.urljoin(request_url, response.headers['Location'])
+        else:
+            break
 
 
 def http_download_binary_file(request_url, file_path, auth=None, headers=None, verify_peer_certificate=True,
