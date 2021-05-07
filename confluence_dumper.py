@@ -32,6 +32,61 @@ CONFLUENCE_DUMPER_VERSION = '1.0.0'
 TITLE_OUTPUT = 'C O N F L U E N C E   D U M P E R  %s' % CONFLUENCE_DUMPER_VERSION
 
 
+class ConfluenceClient(object):
+    def __init__(self, base_url):
+        self.base_url = base_url
+
+    def get_page_details_by_page_id(self, page_id):
+        response = self.request('/rest/api/content/%s?expand=children.page,children.attachment,body.view.value' % page_id)
+        return response['title'], response['body']['view']['value']
+
+    def get_homepage_info(self, space):
+        response = self.request('/rest/api/space/%s?expand=homepage' % space)
+        homepage_id = None
+        if 'homepage' in response:
+            homepage_id = response['homepage']['id']
+        return response['name'], homepage_id
+
+    def iterate_child_pages_by_page_id(self, page_id):
+        for page in self.iterate_page('/rest/api/content/%s/child/page?limit=25' % page_id):
+            yield page
+
+    def iterate_attachments_by_page_id(self, page_id):
+        for page in self.iterate_page('/rest/api/content/%s/child/attachment?limit=25' % page_id):
+            yield page
+
+    def iterate_spaces(self):
+        for space in self.iterate_page('/rest/api/space?limit=25'):
+            yield space
+
+    def request(self, page_url):
+        return utils.http_get(
+            '%s%s' % (self.base_url, page_url),
+            auth=settings.HTTP_AUTHENTICATION,
+            headers=settings.HTTP_CUSTOM_HEADERS,
+            verify_peer_certificate=settings.VERIFY_PEER_CERTIFICATE,
+            proxies=settings.HTTP_PROXIES,
+        )
+
+    def iterate_page(self, start_page_url):
+        page_url = start_page_url
+        counter = 0
+        while page_url:
+            response = self.request(page_url)
+            counter += len(response['results'])
+            for result in response['results']:
+                yield result
+
+            if 'next' in response['_links'].keys():
+                page_url = response['_links']['next']
+                page_url = '%s%s' % (settings.CONFLUENCE_BASE_URL, page_url)
+            else:
+                page_url = None
+
+
+conf_client = ConfluenceClient(settings.CONFLUENCE_BASE_URL)
+
+
 def error_print(*args, **kwargs):
     """ Wrapper for the print function which leads to stderr outputs.
 
@@ -272,32 +327,20 @@ def create_html_attachment_index(attachments):
 
 
 def download_attachments_of_page(page_id, download_folder, attachment_duplicate_file_names, attachment_file_matching, depth):
-    page_url = '%s/rest/api/content/%s/child/attachment?limit=25' % (settings.CONFLUENCE_BASE_URL, page_id)
-    counter = 0
     child_attachments = []
-    while page_url:
-        response = utils.http_get(page_url, auth=settings.HTTP_AUTHENTICATION, headers=settings.HTTP_CUSTOM_HEADERS,
-                                  verify_peer_certificate=settings.VERIFY_PEER_CERTIFICATE,
-                                  proxies=settings.HTTP_PROXIES)
-        counter += len(response['results'])
-        for attachment in response['results']:
-            download_url = attachment['_links']['download']
-            attachment_id = attachment['id'][3:]
-            attachment_info = download_attachment(
-                download_url,
-                download_folder,
-                attachment_id,
-                attachment_duplicate_file_names,
-                attachment_file_matching,
-                depth=depth,
-            )
-            child_attachments.append(attachment_info)
+    for attachment in conf_client.iterate_attachments_by_page_id(page_id):
+        download_url = attachment['_links']['download']
+        attachment_id = attachment['id'][3:]
+        attachment_info = download_attachment(
+            download_url,
+            download_folder,
+            attachment_id,
+            attachment_duplicate_file_names,
+            attachment_file_matching,
+            depth=depth,
+        )
+        child_attachments.append(attachment_info)
 
-        if 'next' in response['_links'].keys():
-            page_url = response['_links']['next']
-            page_url = '%s%s' % (settings.CONFLUENCE_BASE_URL, page_url)
-        else:
-            page_url = None
     return child_attachments
 
 
@@ -343,15 +386,8 @@ def fetch_page_recursively(page_id, folder_path, download_folder, html_template,
     if not attachment_file_matching:
         attachment_file_matching = {}
 
-    page_url = '%s/rest/api/content/%s?expand=children.page,children.attachment,body.view.value' \
-               % (settings.CONFLUENCE_BASE_URL, page_id)
     try:
-        response = utils.http_get(page_url, auth=settings.HTTP_AUTHENTICATION, headers=settings.HTTP_CUSTOM_HEADERS,
-                                  verify_peer_certificate=settings.VERIFY_PEER_CERTIFICATE,
-                                  proxies=settings.HTTP_PROXIES)
-        page_content = response['body']['view']['value']
-
-        page_title = response['title']
+        page_title, page_content = conf_client.get_page_details_by_page_id(page_id)
         print('%sPAGE: %s (%s)' % ('\t' * (depth + 1), page_title, page_id))
 
         # Parse HTML
@@ -399,25 +435,13 @@ def fetch_page_recursively(page_id, folder_path, download_folder, html_template,
                                 additional_headers=[id_file_forward_header])
 
         # Iterate through all child pages
-        page_url = '%s/rest/api/content/%s/child/page?limit=25' % (settings.CONFLUENCE_BASE_URL, page_id)
-        counter = 0
-        while page_url:
-            response = utils.http_get(page_url, auth=settings.HTTP_AUTHENTICATION, headers=settings.HTTP_CUSTOM_HEADERS,
-                                      verify_peer_certificate=settings.VERIFY_PEER_CERTIFICATE,
-                                      proxies=settings.HTTP_PROXIES)
-            counter += len(response['results'])
-            for child_page in response['results']:
-                paths = fetch_page_recursively(child_page['id'], folder_path, download_folder, html_template,
-                                               depth=depth + 1, page_duplicate_file_names=page_duplicate_file_names,
-                                               page_file_matching=page_file_matching)
-                if paths:
-                    path_collection['child_pages'].append(paths)
+        for child_page in conf_client.iterate_child_pages_by_page_id(page_id):
+            paths = fetch_page_recursively(child_page['id'], folder_path, download_folder, html_template,
+                                           depth=depth + 1, page_duplicate_file_names=page_duplicate_file_names,
+                                           page_file_matching=page_file_matching)
+            if paths:
+                path_collection['child_pages'].append(paths)
 
-            if 'next' in response['_links'].keys():
-                page_url = response['_links']['next']
-                page_url = '%s%s' % (settings.CONFLUENCE_BASE_URL, page_url)
-            else:
-                page_url = None
         return path_collection
 
     except utils.ConfluenceException as e:
@@ -485,20 +509,7 @@ def main():
     if len(settings.SPACES_TO_EXPORT) > 0:
         spaces_to_export = settings.SPACES_TO_EXPORT
     else:
-        spaces_to_export = []
-        page_url = '%s/rest/api/space?limit=25' % settings.CONFLUENCE_BASE_URL
-        while page_url:
-            response = utils.http_get(page_url, auth=settings.HTTP_AUTHENTICATION, headers=settings.HTTP_CUSTOM_HEADERS,
-                                      verify_peer_certificate=settings.VERIFY_PEER_CERTIFICATE,
-                                      proxies=settings.HTTP_PROXIES)
-            for space in response['results']:
-                spaces_to_export.append(space['key'])
-
-            if 'next' in response['_links'].keys():
-                page_url = response['_links']['next']
-                page_url = '%s%s' % (settings.CONFLUENCE_BASE_URL, page_url)
-            else:
-                page_url = None
+        spaces_to_export = [space['key'] for space in conf_client.iterate_spaces()]
 
     print('Exporting %d space(s): %s\n' % (len(spaces_to_export), ', '.join(spaces_to_export)))
 
@@ -517,19 +528,9 @@ def main():
             download_folder = '%s/%s' % (space_folder, settings.DOWNLOAD_SUB_FOLDER)
             os.makedirs(download_folder)
 
-            space_url = '%s/rest/api/space/%s?expand=homepage' % (settings.CONFLUENCE_BASE_URL, space)
-            response = utils.http_get(space_url, auth=settings.HTTP_AUTHENTICATION,
-                                      headers=settings.HTTP_CUSTOM_HEADERS,
-                                      verify_peer_certificate=settings.VERIFY_PEER_CERTIFICATE,
-                                      proxies=settings.HTTP_PROXIES)
-            space_name = response['name']
+            space_name, space_page_id = conf_client.get_homepage_info(space)
 
             print('SPACE (%d/%d): %s (%s)' % (space_counter, len(spaces_to_export), space_name, space))
-
-            if "homepage" in response.keys():
-                space_page_id = response['homepage']['id']
-            else:
-                space_page_id = -1
 
             path_collection = fetch_page_recursively(space_page_id, space_folder, download_folder, html_template)
 
