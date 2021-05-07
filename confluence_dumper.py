@@ -21,6 +21,7 @@ import codecs
 import os
 import shutil
 from six.moves import urllib_parse
+from collections import namedtuple
 
 from lxml import html
 from lxml.etree import XMLSyntaxError
@@ -83,6 +84,8 @@ class ConfluenceClient(object):
             else:
                 page_url = None
 
+
+PageInfo = namedtuple('PageInfo', ['file_path', 'page_title', 'child_pages', 'child_attachments'])
 
 conf_client = ConfluenceClient(settings.CONFLUENCE_BASE_URL)
 
@@ -173,7 +176,7 @@ def parse_html_tree(html_content):
     return html.fromstring(html_content)
 
 
-def handle_html_references(html_tree, page_duplicate_file_names, page_file_matching):
+def handle_html_references(html_tree, page_duplicate_file_names, page_file_matching, depth=0):
     """ Repairs links in the page contents with local links.
 
     :param html_tree: Confluence HTML tree.
@@ -192,7 +195,7 @@ def handle_html_references(html_tree, page_duplicate_file_names, page_file_match
     xpath_expr = '//a[contains(@href, "/display/")]'
     for link_element in html_tree.xpath(xpath_expr):
         if not link_element.get('class'):
-            print("\033[1;30;40m" + "LINK - " + link_element.attrib['href'] + "\033[m")
+            print("%s\033[1;30;40mLINK - %s\033[m" % ('\t' * (depth + 1), link_element.attrib['href']))
             path_name = urllib_parse.urlparse(link_element.attrib['href']).path
             page_title = path_name.split('/')[-1].replace('+', ' ')
 
@@ -345,6 +348,8 @@ def download_attachments_of_page(page_id, download_folder, attachment_duplicate_
 
 
 def download_temp_attachments_of_page(page_tree, download_folder, attachment_duplicate_file_names, attachment_file_matching, depth):
+    if page_tree is None:
+        return []
     child_attachments = []
     for img_element in page_tree.xpath('//img[contains(@src, "/download/temp/")]'):
         file_url = img_element.attrib['src']
@@ -375,7 +380,8 @@ def fetch_page_recursively(page_id, folder_path, download_folder, html_template,
     :param attachment_duplicate_file_names: A dict in the structure {'<sanitized attachment filename>': amount of \
                                             duplicates}
     :param attachment_file_matching: A dict in the structure {'<attachment title>': '<used offline filename>'}
-    :returns: Information about downloaded files (pages, attachments, images, ...) as a dict (None for exceptions)
+    :rtype: PageInfo
+    :returns: Information about downloaded files (pages, attachments, images, ...) as a PageInfo (None for exceptions)
     """
     if not page_duplicate_file_names:
         page_duplicate_file_names = {}
@@ -401,17 +407,17 @@ def fetch_page_recursively(page_id, folder_path, download_folder, html_template,
         file_name = provide_unique_file_name(page_duplicate_file_names, page_file_matching, page_title, explicit_file_extension='html')
 
         # Remember this file and all children
-        path_collection = {'file_path': file_name, 'page_title': page_title, 'child_pages': [], 'child_attachments': []}
+        path_collection = PageInfo(file_path=file_name, page_title=page_title, child_pages=[], child_attachments=[])
 
         # Download attachments of this page
-        path_collection['child_attachments'].extend(download_attachments_of_page(
+        path_collection.child_attachments.extend(download_attachments_of_page(
             page_id,
             download_folder,
             attachment_duplicate_file_names,
             attachment_file_matching,
             depth=depth + 1,
         ))
-        path_collection['child_attachments'].extend(download_temp_attachments_of_page(
+        path_collection.child_attachments.extend(download_temp_attachments_of_page(
             html_tree,
             download_folder,
             attachment_duplicate_file_names,
@@ -420,9 +426,9 @@ def fetch_page_recursively(page_id, folder_path, download_folder, html_template,
         ))
         # Export HTML file
         if html_tree is not None:
-            page_content = handle_html_references(html_tree, page_duplicate_file_names, page_file_matching)
+            page_content = handle_html_references(html_tree, page_duplicate_file_names, page_file_matching, depth + 1)
         file_path = '%s/%s' % (folder_path, file_name)
-        page_content += create_html_attachment_index(path_collection['child_attachments'])
+        page_content += create_html_attachment_index(path_collection.child_attachments)
         utils.write_html_2_file(file_path, page_title, page_content, html_template)
 
         # Save another file with page id which forwards to the original one
@@ -440,7 +446,7 @@ def fetch_page_recursively(page_id, folder_path, download_folder, html_template,
                                            depth=depth + 1, page_duplicate_file_names=page_duplicate_file_names,
                                            page_file_matching=page_file_matching)
             if paths:
-                path_collection['child_pages'].append(paths)
+                path_collection.child_pages.append(paths)
 
         return path_collection
 
@@ -452,12 +458,12 @@ def fetch_page_recursively(page_id, folder_path, download_folder, html_template,
 def create_html_index(index_content):
     """ Creates an HTML index (mainly to navigate through the exported pages).
 
-    :param index_content: Dictionary which contains file paths, page titles and their children recursively.
+    :param PageInfo index_content: PageInfo contains file paths, page titles and their children recursively.
     :returns: Content index as HTML.
     """
-    file_path = utils.encode_url(index_content['file_path'])
-    page_title = index_content['page_title']
-    page_children = index_content['child_pages']
+    file_path = utils.encode_url(index_content.file_path)
+    page_title = index_content.page_title
+    page_children = index_content.child_pages
 
     html_content = '<a href="%s">%s</a>' % (utils.sanitize_for_filename(file_path), page_title)
 
@@ -506,39 +512,42 @@ def main():
     html_template = template_file.read()
 
     # Fetch all spaces if spaces were not configured via settings
-    if len(settings.SPACES_TO_EXPORT) > 0:
-        spaces_to_export = settings.SPACES_TO_EXPORT
+    if len(settings.SPACES_PAGES_TO_EXPORT.keys()) > 0:
+        spaces_pages_to_export = settings.SPACES_PAGES_TO_EXPORT
     else:
-        spaces_to_export = [space['key'] for space in conf_client.iterate_spaces()]
+        spaces_pages_to_export = {space['key']: None for space in conf_client.iterate_spaces()}
 
-    print('Exporting %d space(s): %s\n' % (len(spaces_to_export), ', '.join(spaces_to_export)))
+    print('Exporting %d space(s): %s\n' % (len(spaces_pages_to_export), ', '.join(spaces_pages_to_export)))
 
     # Export spaces
     space_counter = 0
     duplicate_space_names = {}
     space_matching = {}
-    for space in spaces_to_export:
+    for space, target_page_ids in spaces_pages_to_export.items():
         space_counter += 1
 
-        # Create folders for this space
+        # Init folders for this space
         space_folder_name = provide_unique_file_name(duplicate_space_names, space_matching, space, is_folder=True)
         space_folder = '%s/%s' % (settings.EXPORT_FOLDER, space_folder_name)
+        os.makedirs(space_folder)
+        download_folder = '%s/%s' % (space_folder, settings.DOWNLOAD_SUB_FOLDER)
+        os.makedirs(download_folder)
         try:
-            os.makedirs(space_folder)
-            download_folder = '%s/%s' % (space_folder, settings.DOWNLOAD_SUB_FOLDER)
-            os.makedirs(download_folder)
-
             space_name, space_page_id = conf_client.get_homepage_info(space)
+            print('SPACE (%d/%d): %s (%s)' % (space_counter, len(spaces_pages_to_export), space_name, space))
 
-            print('SPACE (%d/%d): %s (%s)' % (space_counter, len(spaces_to_export), space_name, space))
+            if target_page_ids is None:
+                target_page_ids = [space_page_id]
 
-            path_collection = fetch_page_recursively(space_page_id, space_folder, download_folder, html_template)
+            index_page_info = PageInfo(file_path="", page_title="Index", child_pages=[], child_attachments=[])
+            for target_page_id in target_page_ids:
+                index_page_info.child_pages.append(fetch_page_recursively(target_page_id, space_folder, download_folder, html_template))
 
-            if path_collection:
+            if index_page_info:
                 # Create index file for this space
                 space_index_path = '%s/index.html' % space_folder
                 space_index_title = 'Index of Space %s (%s)' % (space_name, space)
-                space_index_content = create_html_index(path_collection)
+                space_index_content = create_html_index(index_page_info)
                 utils.write_html_2_file(space_index_path, space_index_title, space_index_content, html_template)
         except utils.ConfluenceException as e:
             error_print('ERROR: %s' % e)
