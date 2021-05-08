@@ -15,6 +15,7 @@ Confluence-dumper is a Python project to export spaces, pages and attachments
 """
 
 from __future__ import print_function
+import argparse
 import sys
 import codecs
 
@@ -41,6 +42,10 @@ class ConfluenceClient(object):
     def get_page_details_by_page_id(self, page_id):
         response = self.request('/rest/api/content/%s?expand=children.page,children.attachment,body.view.value' % page_id)
         return response['title'], response['body']['view']['value']
+
+    def get_page_space_by_page_id(self, page_id):
+        response = self.request('/rest/api/content/%s?expand=space' % page_id)
+        return response['space']['key']
 
     def get_homepage_info(self, space):
         response = self.request('/rest/api/space/%s?expand=homepage' % space)
@@ -522,7 +527,23 @@ def print_finished_output():
     print('\n\nFinished!\n')
 
 
-def main():
+def convert_space_pages_to_export(mode):
+    spaces_pages_to_export = {}
+    if mode == 'space':
+        # Fetch all spaces if spaces were not configured via settings
+        if len(settings.SPACES_PAGES_TO_EXPORT.keys()) > 0:
+            spaces_pages_to_export = settings.SPACES_PAGES_TO_EXPORT
+        else:
+            spaces_pages_to_export = {space['key']: None for space in conf_client.iterate_spaces()}
+    elif mode == 'page':
+        for page_id in settings.PAGES_TO_EXPORT:
+            space_key = conf_client.get_page_space_by_page_id(page_id)
+            spaces_pages_to_export.setdefault(space_key, []).append(page_id)
+
+    return spaces_pages_to_export
+
+
+def main(args):
     """ Main function to start the confluence-dumper. """
 
     # Configure console for unicode output via stdout/stderr
@@ -541,10 +562,7 @@ def main():
     html_template = template_file.read()
 
     # Fetch all spaces if spaces were not configured via settings
-    if len(settings.SPACES_PAGES_TO_EXPORT.keys()) > 0:
-        spaces_pages_to_export = settings.SPACES_PAGES_TO_EXPORT
-    else:
-        spaces_pages_to_export = {space['key']: None for space in conf_client.iterate_spaces()}
+    spaces_pages_to_export = convert_space_pages_to_export(args.mode)
 
     print('Exporting %d space(s): %s\n' % (len(spaces_pages_to_export), ', '.join(spaces_pages_to_export)))
 
@@ -588,9 +606,16 @@ def main():
     print_finished_output()
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description='Confluence dumps')
+    parser.add_argument('--mode', dest="mode", choices=('space', 'page'), action='store')
+
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
     try:
-        main()
+        main(parse_args())
     except KeyboardInterrupt:
         error_print('ERROR: Keyboard Interrupt.')
         sys.exit(1)
