@@ -47,6 +47,13 @@ class ConfluenceClient(object):
         response = self.request('/rest/api/content/%s?expand=space' % page_id)
         return response['space']['key']
 
+    def get_page_by_title(self, title, space_key=None):
+        params = {"title": title}
+        if space_key:
+            params['spaceKey'] = space_key
+        response = self.request('/rest/api/content?%s' % urllib_parse.urlencode(params))
+        return response['results'][0]['id'] if response['results'] else None
+
     def get_homepage_info(self, space):
         response = self.request('/rest/api/space/%s?expand=homepage' % space)
         homepage_id = None
@@ -64,7 +71,19 @@ class ConfluenceClient(object):
             return self.__cached_tinyurl[hash_val]
 
         page_id = None
-        for redirect_url in utils.http_get_iterate_redirect_url("{}/pages/tinyurl.action?urlIdentifier={}".format(self.base_url, hash_val)):
+        for redirect_url in utils.http_get_iterate_redirect_url(
+            "{}/pages/tinyurl.action?urlIdentifier={}".format(self.base_url, hash_val),
+            auth=settings.HTTP_AUTHENTICATION,
+            headers=settings.HTTP_CUSTOM_HEADERS,
+            verify_peer_certificate=settings.VERIFY_PEER_CERTIFICATE,
+            proxies=settings.HTTP_PROXIES,
+        ):
+            if 'display' in redirect_url:
+                path_comp = urllib_parse.urlparse(redirect_url).path.split('/')
+                space_key, title = path_comp[-2:]
+                page_id = self.get_page_by_title(urllib_parse.unquote_plus(title), space_key=space_key)
+                break
+
             if 'pageId' in redirect_url:
                 queries = urllib_parse.parse_qs(urllib_parse.urlparse(redirect_url).query)
                 page_id = int(queries['pageId'][0]) if 'pageId' in queries else None
@@ -75,20 +94,20 @@ class ConfluenceClient(object):
         return page_id
 
     def iterate_child_pages_by_page_id(self, page_id):
-        for page in self.iterate_page('/rest/api/content/%s/child/page?limit=25' % page_id):
+        for page in self.iterate_page('/rest/api/content/%s/child/page?limit=50' % page_id):
             yield page
 
     def iterate_attachments_by_page_id(self, page_id):
-        for page in self.iterate_page('/rest/api/content/%s/child/attachment?limit=25' % page_id):
+        for page in self.iterate_page('/rest/api/content/%s/child/attachment?limit=50' % page_id):
             yield page
 
     def iterate_spaces(self):
-        for space in self.iterate_page('/rest/api/space?limit=25'):
+        for space in self.iterate_page('/rest/api/space?limit=50'):
             yield space
 
     def request(self, page_url):
         return utils.http_get(
-            '%s%s' % (self.base_url, page_url),
+            urllib_parse.urljoin(self.base_url, page_url),
             auth=settings.HTTP_AUTHENTICATION,
             headers=settings.HTTP_CUSTOM_HEADERS,
             verify_peer_certificate=settings.VERIFY_PEER_CERTIFICATE,
@@ -106,7 +125,7 @@ class ConfluenceClient(object):
 
             if 'next' in response['_links'].keys():
                 page_url = response['_links']['next']
-                page_url = '%s%s' % (settings.CONFLUENCE_BASE_URL, page_url)
+                page_url = urllib_parse.urljoin(settings.CONFLUENCE_BASE_URL, page_url)
             else:
                 page_url = None
 
