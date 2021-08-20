@@ -21,11 +21,13 @@ import codecs
 
 import os
 import shutil
+import sqlite3
 from six.moves import urllib_parse
 from collections import namedtuple
 
 from lxml import html
 from lxml.etree import XMLSyntaxError
+from dateutil import parser as date_parser
 
 import utils
 import settings
@@ -40,8 +42,14 @@ class ConfluenceClient(object):
         self.__cached_tinyurl = {}
 
     def get_page_details_by_page_id(self, page_id):
-        response = self.request('/rest/api/content/%s?expand=children.page,children.attachment,body.view.value' % page_id)
-        return response['title'], response['body']['view']['value']
+        response = self.request('/rest/api/content/%s?expand=children.page,children.attachment,body.view.value,version' % page_id)
+        return PageTab(
+            page_id,
+            response['title'],
+            None,
+            None,
+            date_parser.parse(response['version']['when']),
+        ), response['body']['view']['value']
 
     def get_page_space_by_page_id(self, page_id):
         response = self.request('/rest/api/content/%s?expand=space' % page_id)
@@ -129,6 +137,59 @@ class ConfluenceClient(object):
             else:
                 page_url = None
 
+
+class ConfluenceDatabase(object):
+    def __init__(self, db_uri):
+        self.conn = sqlite3.connect(db_uri)
+        self.init_table()
+
+    def init_table(self):
+        cursor = self.conn.cursor()
+        cursor.executescript("""
+        CREATE TABLE IF NOT EXISTS page_tab (
+            page_id integer primary key,
+            title varchar,
+            hash varchar,
+            space varchar,
+            mtime date
+        );
+        CREATE INDEX IF NOT EXISTS page_hash_idx ON page_tab(hash);
+        """)
+        self.conn.commit()
+
+    def get_page_by_id(self, page_id):
+        cursor = self.conn.cursor()
+        cursor.execute("select * from page_tab where page_id = ?;", (page_id,))
+        rs = cursor.fetchone()
+        return PageTab(rs[0], rs[1], rs[2], rs[3], date_parser.parse(rs[4])) if rs else None
+
+    def insert_page(self, page):
+        """
+        :param PageTab page:
+        :return:
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("Insert into page_tab values (?, ?, ?, ?, ?)", (page.page_id, page.title, page.hash, page.space, page.mtime))
+        self.conn.commit()
+
+    def update_page(self, page):
+        cursor = self.conn.cursor()
+        cursor.execute("Update page_tab SET title = ?, hash = ?, space= ?, mtime = ? WHERE page_id = ?",
+                       (page.title, page.hash, page.space, page.mtime, page.page_id))
+        self.conn.commit()
+
+    def upsert_page(self, page):
+        page_tab = self.get_page_by_id(page.page_id)
+        if not page_tab:
+            self.insert_page(page)
+            return True
+        if page_tab and page_tab.mtime < page.mtime:
+            self.update_page(page)
+            return True
+        return False
+
+
+PageTab = namedtuple("PageTab", ['page_id', 'title', 'hash', 'space', 'mtime'])
 
 PageInfo = namedtuple('PageInfo', ['file_path', 'page_title', 'child_pages', 'child_attachments'])
 
@@ -420,7 +481,7 @@ def download_temp_attachments_of_page(page_tree, download_folder, attachment_dup
 
 def fetch_page_recursively(page_id, folder_path, download_folder, html_template, depth=0,
                            page_duplicate_file_names=None, page_file_matching=None,
-                           attachment_duplicate_file_names=None, attachment_file_matching=None):
+                           attachment_duplicate_file_names=None, attachment_file_matching=None, db=None):
     """ Fetches a Confluence page and its child pages (with referenced downloads).
 
     :param page_id: Confluence page id.
@@ -446,58 +507,60 @@ def fetch_page_recursively(page_id, folder_path, download_folder, html_template,
         attachment_file_matching = {}
 
     try:
-        page_title, page_content = conf_client.get_page_details_by_page_id(page_id)
-        print('%sPAGE: %s (%s)' % ('\t' * (depth + 1), page_title, page_id))
+        page, page_content = conf_client.get_page_details_by_page_id(page_id)
 
-        # Parse HTML
-        html_tree = None
-        try:
-            html_tree = parse_html_tree(page_content)
-        except XMLSyntaxError:
-            print('%sWARNING: Could not parse HTML content of last page. Original content will be downloaded as it is.' % ('\t' * (depth + 1)))
+        is_new_page = db.upsert_page(page)
+        print('%sPAGE: %s (%s)' % ('\t' * (depth + 1), page.title, page_id), "SKIP" if not is_new_page else "")
 
         # Construct unique file name
-        file_name = provide_unique_file_name(page_duplicate_file_names, page_file_matching, page_title, explicit_file_extension='html')
+        file_name = provide_unique_file_name(page_duplicate_file_names, page_file_matching, page.title, explicit_file_extension='html')
 
         # Remember this file and all children
-        path_collection = PageInfo(file_path=file_name, page_title=page_title, child_pages=[], child_attachments=[])
+        path_collection = PageInfo(file_path=file_name, page_title=page.title, child_pages=[], child_attachments=[])
 
-        # Download attachments of this page
-        path_collection.child_attachments.extend(download_attachments_of_page(
-            page_id,
-            download_folder,
-            attachment_duplicate_file_names,
-            attachment_file_matching,
-            depth=depth + 1,
-        ))
-        path_collection.child_attachments.extend(download_temp_attachments_of_page(
-            html_tree,
-            download_folder,
-            attachment_duplicate_file_names,
-            attachment_file_matching,
-            depth=depth + 1,
-        ))
-        # Export HTML file
-        if html_tree is not None:
-            page_content = handle_html_references(html_tree, page_duplicate_file_names, page_file_matching, depth + 1)
-        file_path = '%s/%s' % (folder_path, file_name)
-        page_content += create_html_attachment_index(path_collection.child_attachments)
-        utils.write_html_2_file(file_path, page_title, page_content, html_template)
+        if is_new_page:
+            # Parse HTML
+            html_tree = None
+            try:
+                html_tree = parse_html_tree(page_content)
+            except XMLSyntaxError:
+                print('%sWARNING: Could not parse HTML content of last page. Original content will be downloaded as it is.' % ('\t' * (depth + 1)))
 
-        # Save another file with page id which forwards to the original one
-        id_file_path = '%s/%s.html' % (folder_path, page_id)
-        id_file_page_title = 'Forward to page %s' % page_title
-        original_file_link = utils.encode_url(utils.sanitize_for_filename(file_name))
-        id_file_page_content = settings.HTML_FORWARD_MESSAGE % (original_file_link, page_title)
-        id_file_forward_header = '<meta http-equiv="refresh" content="0; url=%s" />' % original_file_link
-        utils.write_html_2_file(id_file_path, id_file_page_title, id_file_page_content, html_template,
-                                additional_headers=[id_file_forward_header])
+            # Download attachments of this page
+            path_collection.child_attachments.extend(download_attachments_of_page(
+                page_id,
+                download_folder,
+                attachment_duplicate_file_names,
+                attachment_file_matching,
+                depth=depth + 1,
+            ))
+            path_collection.child_attachments.extend(download_temp_attachments_of_page(
+                html_tree,
+                download_folder,
+                attachment_duplicate_file_names,
+                attachment_file_matching,
+                depth=depth + 1,
+            ))
+            # Export HTML file
+            if html_tree is not None:
+                page_content = handle_html_references(html_tree, page_duplicate_file_names, page_file_matching, depth + 1)
+            file_path = '%s/%s' % (folder_path, file_name)
+            page_content += create_html_attachment_index(path_collection.child_attachments)
+            utils.write_html_2_file(file_path, page.title, page_content, html_template)
+
+            # Save another file with page id which forwards to the original one
+            id_file_path = '%s/%s.html' % (folder_path, page_id)
+            id_file_page_title = 'Forward to page %s' % page.title
+            original_file_link = utils.encode_url(utils.sanitize_for_filename(file_name))
+            id_file_page_content = settings.HTML_FORWARD_MESSAGE % (original_file_link, page.title)
+            id_file_forward_header = '<meta http-equiv="refresh" content="0; url=%s" />' % original_file_link
+            utils.write_html_2_file(id_file_path, id_file_page_title, id_file_page_content, html_template, additional_headers=[id_file_forward_header])
 
         # Iterate through all child pages
         for child_page in conf_client.iterate_child_pages_by_page_id(page_id):
             paths = fetch_page_recursively(child_page['id'], folder_path, download_folder, html_template,
                                            depth=depth + 1, page_duplicate_file_names=page_duplicate_file_names,
-                                           page_file_matching=page_file_matching)
+                                           page_file_matching=page_file_matching, db=db)
             if paths:
                 path_collection.child_pages.append(paths)
 
@@ -562,6 +625,13 @@ def convert_space_pages_to_export(mode):
     return spaces_pages_to_export
 
 
+def mkdir(folder):
+    try:
+        os.makedirs(folder)
+    except:
+        pass
+
+
 def main(args):
     """ Main function to start the confluence-dumper. """
 
@@ -572,9 +642,9 @@ def main(args):
     # Welcome output
     print_welcome_output()
     # Delete old export
-    if os.path.exists(settings.EXPORT_FOLDER):
-        shutil.rmtree(settings.EXPORT_FOLDER)
-    os.makedirs(settings.EXPORT_FOLDER)
+    # if os.path.exists(settings.EXPORT_FOLDER):
+    #     shutil.rmtree(settings.EXPORT_FOLDER)
+    mkdir(settings.EXPORT_FOLDER)
 
     # Read HTML template
     template_file = open(settings.TEMPLATE_FILE)
@@ -582,6 +652,8 @@ def main(args):
 
     # Fetch all spaces if spaces were not configured via settings
     spaces_pages_to_export = convert_space_pages_to_export(args.mode)
+
+    db = ConfluenceDatabase("conf.db")
 
     print('Exporting %d space(s): %s\n' % (len(spaces_pages_to_export), ', '.join(spaces_pages_to_export)))
 
@@ -595,9 +667,9 @@ def main(args):
         # Init folders for this space
         space_folder_name = provide_unique_file_name(duplicate_space_names, space_matching, space, is_folder=True)
         space_folder = '%s/%s' % (settings.EXPORT_FOLDER, space_folder_name)
-        os.makedirs(space_folder)
+        mkdir(space_folder)
         download_folder = '%s/%s' % (space_folder, settings.DOWNLOAD_SUB_FOLDER)
-        os.makedirs(download_folder)
+        mkdir(download_folder)
         try:
             space_name, space_page_id = conf_client.get_homepage_info(space)
             print('SPACE (%d/%d): %s (%s)' % (space_counter, len(spaces_pages_to_export), space_name, space))
@@ -607,7 +679,7 @@ def main(args):
 
             index_page_info = PageInfo(file_path="", page_title="Index", child_pages=[], child_attachments=[])
             for target_page_id in target_page_ids:
-                index_page_info.child_pages.append(fetch_page_recursively(target_page_id, space_folder, download_folder, html_template))
+                index_page_info.child_pages.append(fetch_page_recursively(target_page_id, space_folder, download_folder, html_template, db=db))
 
             if index_page_info:
                 # Create index file for this space
