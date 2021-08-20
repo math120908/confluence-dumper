@@ -199,6 +199,66 @@ class ConfluenceDatabase(object):
         return False
 
 
+class FolderManager(object):
+    def __init__(self, folder):
+        self.folder = folder
+        self.title_to_filename = {}  # {'<file title>': '<used offline filename>'}
+        self.duplicate_filenames = {}  # {'<sanitized filename>': amount of duplicates}
+
+    def provide_unique_filename(
+        self,
+        file_title,
+        is_folder=False,
+        explicit_file_extension=None,
+    ):
+        """ Provides an unique AND sanitized file name for a given page title. Confluence does not allow the same page title
+        in one particular space but collisions are possible after filesystem sanitization.
+
+        :param file_title: File title which is used to generate the unique file name
+        :param is_folder: (optional) Flag which states whether the file is a folder
+        :param explicit_file_extension: (optional) Explicitly set file extension (e.g. 'html')
+        """
+        if file_title in self.title_to_filename:
+            return self.title_to_filename[file_title]
+
+        file_name = utils.sanitize_for_filename(file_title)
+
+        if is_folder:
+            file_extension = None
+        elif explicit_file_extension:
+            file_extension = explicit_file_extension
+        else:
+            if '.' in file_name:
+                file_name, file_extension = file_name.rsplit('.', 1)
+            else:
+                file_extension = None
+
+        if file_name in self.duplicate_filenames:
+            self.duplicate_filenames[file_name] += 1
+            file_name = '%s_%d' % (file_name, self.duplicate_filenames[file_name])
+        else:
+            self.duplicate_filenames[file_name] = 0
+            file_name = file_name
+
+        if file_extension:
+            file_name += '.%s' % file_extension
+
+        self.title_to_filename[file_title] = file_name
+        return file_name
+
+
+class SpaceFileSystem(object):
+    def __init__(self, folder_path, download_folder):
+        self.page_folder_manager = FolderManager(folder_path)
+        self.download_folder_manager = FolderManager(download_folder)
+
+    def get_file_path(self, file_name):
+        return '%s/%s' % (self.page_folder_manager.folder, file_name)
+
+    def get_id_file_path(self, page_id):
+        return '%s/%s.html' % (self.page_folder_manager.folder, page_id)
+
+
 PageTab = namedtuple("PageTab", ['page_id', 'title', 'hash', 'space', 'mtime'])
 
 PageInfo = namedtuple('PageInfo', ['file_path', 'page_title', 'child_pages', 'child_attachments'])
@@ -246,58 +306,17 @@ def derive_downloaded_file_name(download_url):
         return None
 
 
-def provide_unique_file_name(duplicate_file_names, file_matching, file_title, is_folder=False,
-                             explicit_file_extension=None):
-    """ Provides an unique AND sanitized file name for a given page title. Confluence does not allow the same page title
-    in one particular space but collisions are possible after filesystem sanitization.
-
-    :param duplicate_file_names: A dict in the structure {'<sanitized filename>': amount of duplicates}
-    :param file_matching: A dict in the structure {'<file title>': '<used offline filename>'}
-    :param file_title: File title which is used to generate the unique file name
-    :param is_folder: (optional) Flag which states whether the file is a folder
-    :param explicit_file_extension: (optional) Explicitly set file extension (e.g. 'html')
-    """
-    if file_title in file_matching:
-        file_name = file_matching[file_title]
-    else:
-        file_name = utils.sanitize_for_filename(file_title)
-
-        if is_folder:
-            file_extension = None
-        elif explicit_file_extension:
-            file_extension = explicit_file_extension
-        else:
-            if '.' in file_name:
-                file_name, file_extension = file_name.rsplit('.', 1)
-            else:
-                file_extension = None
-
-        if file_name in duplicate_file_names:
-            duplicate_file_names[file_name] += 1
-            file_name = '%s_%d' % (file_name, duplicate_file_names[file_name])
-        else:
-            duplicate_file_names[file_name] = 0
-            file_name = file_name
-
-        if file_extension:
-            file_name += '.%s' % file_extension
-
-        file_matching[file_title] = file_name
-    return file_name
-
-
 def parse_html_tree(html_content):
     if html_content == "":
         return None
     return html.fromstring(html_content)
 
 
-def handle_html_references(html_tree, page_duplicate_file_names, page_file_matching, depth=0):
+def handle_html_references(html_tree, fs, depth=0):
     """ Repairs links in the page contents with local links.
 
     :param html_tree: Confluence HTML tree.
-    :param page_duplicate_file_names: A dict in the structure {'<sanitized filename>': amount of duplicates}
-    :param page_file_matching: A dict in the structure {'<page title>': '<used offline filename>'}
+    :param SpaceFileSystem fs:
     :param depth: (optional) Hierarchy depth of the handled Confluence page.
     :returns: Fixed HTML content.
     """
@@ -316,8 +335,7 @@ def handle_html_references(html_tree, page_duplicate_file_names, page_file_match
             page_title = path_name.split('/')[-1].replace('+', ' ')
 
             decoded_page_title = utils.decode_url(page_title)
-            offline_link = provide_unique_file_name(page_duplicate_file_names, page_file_matching, decoded_page_title,
-                                                    explicit_file_extension='html')
+            offline_link = fs.page_folder_manager.provide_unique_filename(decoded_page_title, explicit_file_extension='html')
             link_element.attrib['href'] = utils.encode_url(offline_link)
 
     xpath_expr = '//a[contains(@href, "/x/")]'
@@ -396,42 +414,34 @@ def download_file(clean_url, download_folder, downloaded_file_name, depth=0, err
     return downloaded_file_path
 
 
-def download_attachment(download_url, download_folder, attachment_id, attachment_duplicate_file_names,
-                        attachment_file_matching, depth=0):
+def download_attachment(download_url, attachment_id, download_fm, depth=0):
     """ Repairs links in the page contents with local links.
 
     :param download_url: Confluence download URL.
-    :param download_folder: Folder to place downloaded files in.
     :param attachment_id: (optional) ID of the attachment to download.
-    :param attachment_duplicate_file_names: A dict in the structure {'<sanitized attachment filename>': amount of \
-                                            duplicates}
-    :param attachment_file_matching: A dict in the structure {'<attachment title>': '<used offline filename>'}
+    :param FolderManager download_fm: download folder manager
     :param depth: (optional) Hierarchy depth of the handled Confluence page.
     :returns: Path and name of the downloaded file as dict.
     """
     clean_url = utils.decode_url(download_url)
     downloaded_file_name = derive_downloaded_file_name(clean_url)
-    downloaded_file_name = provide_unique_file_name(attachment_duplicate_file_names, attachment_file_matching,
-                                                    downloaded_file_name)
-    downloaded_file_path = download_file(download_url, download_folder, downloaded_file_name, depth=depth)
+    downloaded_file_name = download_fm.provide_unique_filename(downloaded_file_name)
+    downloaded_file_path = download_file(download_url, download_fm.folder, downloaded_file_name, depth=depth)
 
     # Download the thumbnail as well if the attachment is an image
     clean_thumbnail_url = clean_url.replace('/attachments/', '/thumbnails/', 1)
     downloaded_thumbnail_file_name = derive_downloaded_file_name(clean_thumbnail_url)
-    downloaded_thumbnail_file_name = provide_unique_file_name(attachment_duplicate_file_names, attachment_file_matching,
-                                                              downloaded_thumbnail_file_name)
+    downloaded_thumbnail_file_name = download_fm.provide_unique_filename(downloaded_thumbnail_file_name)
     if utils.is_file_format(downloaded_thumbnail_file_name, settings.CONFLUENCE_THUMBNAIL_FORMATS):
         # TODO: Confluence creates thumbnails always as PNGs but does not change the file extension to .png.
-        download_file(clean_thumbnail_url, download_folder, downloaded_thumbnail_file_name, depth=depth,
-                      error_output=False)
+        download_file(clean_thumbnail_url, download_fm.folder, downloaded_thumbnail_file_name, depth=depth, error_output=False)
 
     # Download the image preview as well if Confluence generated one for the attachment
     if attachment_id is not None and utils.is_file_format(downloaded_file_name, settings.CONFLUENCE_GENERATED_PREVIEW_FORMATS):
         clean_preview_url = '/rest/documentConversion/latest/conversion/thumbnail/%s/1' % attachment_id
         downloaded_preview_file_name = derive_downloaded_file_name(clean_preview_url)
-        downloaded_preview_file_name = provide_unique_file_name(attachment_duplicate_file_names,
-                                                                attachment_file_matching, downloaded_preview_file_name)
-        download_file(clean_preview_url, download_folder, downloaded_preview_file_name, depth=depth, error_output=False)
+        downloaded_preview_file_name = download_fm.provide_unique_filename(downloaded_preview_file_name)
+        download_file(clean_preview_url, download_fm.folder, downloaded_preview_file_name, depth=depth, error_output=False)
 
     return {'file_name': downloaded_file_name, 'file_path': downloaded_file_path}
 
@@ -453,17 +463,15 @@ def create_html_attachment_index(attachments):
     return html_content
 
 
-def download_attachments_of_page(page_id, download_folder, attachment_duplicate_file_names, attachment_file_matching, depth):
+def download_attachments_of_page(page_id, download_fm, depth):
     child_attachments = []
     for attachment in conf_client.iterate_attachments_by_page_id(page_id):
         download_url = attachment['_links']['download']
         attachment_id = attachment['id'][3:]
         attachment_info = download_attachment(
             download_url,
-            download_folder,
             attachment_id,
-            attachment_duplicate_file_names,
-            attachment_file_matching,
+            download_fm,
             depth=depth,
         )
         child_attachments.append(attachment_info)
@@ -471,7 +479,7 @@ def download_attachments_of_page(page_id, download_folder, attachment_duplicate_
     return child_attachments
 
 
-def download_temp_attachments_of_page(page_tree, download_folder, attachment_duplicate_file_names, attachment_file_matching, depth):
+def download_temp_attachments_of_page(page_tree, download_fm, depth):
     if page_tree is None:
         return []
     child_attachments = []
@@ -479,42 +487,24 @@ def download_temp_attachments_of_page(page_tree, download_folder, attachment_dup
         file_url = img_element.attrib['src']
         attachment_info = download_attachment(
             file_url,
-            download_folder,
             None,
-            attachment_duplicate_file_names,
-            attachment_file_matching,
+            download_fm,
             depth=depth,
         )
         child_attachments.append(attachment_info)
     return child_attachments
 
 
-def fetch_page_recursively(page_id, folder_path, download_folder, html_template, depth=0,
-                           page_duplicate_file_names=None, page_file_matching=None,
-                           attachment_duplicate_file_names=None, attachment_file_matching=None, db=None, force_update=False):
+def fetch_page_recursively(page_id, fs, html_template, depth=0, db=None, force_update=False):
     """ Fetches a Confluence page and its child pages (with referenced downloads).
 
     :param page_id: Confluence page id.
-    :param folder_path: Folder to place downloaded pages in.
-    :param download_folder: Folder to place downloaded files in.
+    :param SpaceFileSystem fs:
     :param html_template: HTML template used to export Confluence pages.
     :param depth: (optional) Hierarchy depth of the handled Confluence page.
-    :param page_duplicate_file_names: A dict in the structure {'<sanitized page filename>': amount of duplicates}
-    :param page_file_matching: A dict in the structure {'<page title>': '<used offline filename>'}
-    :param attachment_duplicate_file_names: A dict in the structure {'<sanitized attachment filename>': amount of \
-                                            duplicates}
-    :param attachment_file_matching: A dict in the structure {'<attachment title>': '<used offline filename>'}
     :rtype: PageInfo
     :returns: Information about downloaded files (pages, attachments, images, ...) as a PageInfo (None for exceptions)
     """
-    if not page_duplicate_file_names:
-        page_duplicate_file_names = {}
-    if not page_file_matching:
-        page_file_matching = {}
-    if not attachment_duplicate_file_names:
-        attachment_duplicate_file_names = {}
-    if not attachment_file_matching:
-        attachment_file_matching = {}
 
     try:
         page, page_content = conf_client.get_page_details_by_page_id(page_id)
@@ -523,7 +513,7 @@ def fetch_page_recursively(page_id, folder_path, download_folder, html_template,
         print('%sPAGE: %s (%s)' % ('\t' * (depth + 1), page.title, page_id), "SKIP" if not is_new_page else "")
 
         # Construct unique file name
-        file_name = provide_unique_file_name(page_duplicate_file_names, page_file_matching, page.title, explicit_file_extension='html')
+        file_name = fs.page_folder_manager.provide_unique_filename(page.title, explicit_file_extension='html')
 
         # Remember this file and all children
         path_collection = PageInfo(file_path=file_name, page_title=page.title, child_pages=[], child_attachments=[])
@@ -539,27 +529,24 @@ def fetch_page_recursively(page_id, folder_path, download_folder, html_template,
             # Download attachments of this page
             path_collection.child_attachments.extend(download_attachments_of_page(
                 page_id,
-                download_folder,
-                attachment_duplicate_file_names,
-                attachment_file_matching,
+                fs.download_folder_manager,
                 depth=depth + 1,
             ))
             path_collection.child_attachments.extend(download_temp_attachments_of_page(
                 html_tree,
-                download_folder,
-                attachment_duplicate_file_names,
-                attachment_file_matching,
+                fs.download_folder_manager,
                 depth=depth + 1,
             ))
             # Export HTML file
             if html_tree is not None:
-                page_content = handle_html_references(html_tree, page_duplicate_file_names, page_file_matching, depth + 1)
-            file_path = '%s/%s' % (folder_path, file_name)
+                page_content = handle_html_references(html_tree, fs, depth + 1)
+
+            file_path = fs.get_file_path(file_name)
             page_content += create_html_attachment_index(path_collection.child_attachments)
             utils.write_html_2_file(file_path, page.title, page_content, html_template)
 
             # Save another file with page id which forwards to the original one
-            id_file_path = '%s/%s.html' % (folder_path, page_id)
+            id_file_path = fs.get_id_file_path(page_id)
             id_file_page_title = 'Forward to page %s' % page.title
             original_file_link = utils.encode_url(utils.sanitize_for_filename(file_name))
             id_file_page_content = settings.HTML_FORWARD_MESSAGE % (original_file_link, page.title)
@@ -568,9 +555,7 @@ def fetch_page_recursively(page_id, folder_path, download_folder, html_template,
 
         # Iterate through all child pages
         for child_page in conf_client.iterate_child_pages_by_page_id(page_id):
-            paths = fetch_page_recursively(child_page['id'], folder_path, download_folder, html_template,
-                                           depth=depth + 1, page_duplicate_file_names=page_duplicate_file_names,
-                                           page_file_matching=page_file_matching, db=db, force_update=force_update)
+            paths = fetch_page_recursively(child_page['id'], fs, html_template, depth=depth + 1, db=db, force_update=force_update)
             if paths:
                 path_collection.child_pages.append(paths)
 
@@ -669,17 +654,15 @@ def main(args):
 
     # Export spaces
     space_counter = 0
-    duplicate_space_names = {}
-    space_matching = {}
     for space, target_page_ids in spaces_pages_to_export.items():
         space_counter += 1
 
         # Init folders for this space
-        space_folder_name = provide_unique_file_name(duplicate_space_names, space_matching, space, is_folder=True)
-        space_folder = '%s/%s' % (settings.EXPORT_FOLDER, space_folder_name)
+        space_folder = '%s/%s' % (settings.EXPORT_FOLDER, space)
         mkdir(space_folder)
         download_folder = '%s/%s' % (space_folder, settings.DOWNLOAD_SUB_FOLDER)
         mkdir(download_folder)
+        fs = SpaceFileSystem(space_folder, download_folder)
         try:
             space_name, space_page_id = conf_client.get_homepage_info(space)
             print('SPACE (%d/%d): %s (%s)' % (space_counter, len(spaces_pages_to_export), space_name, space))
@@ -689,7 +672,7 @@ def main(args):
 
             index_page_info = PageInfo(file_path="", page_title="Index", child_pages=[], child_attachments=[])
             for target_page_id in target_page_ids:
-                index_page_info.child_pages.append(fetch_page_recursively(target_page_id, space_folder, download_folder, html_template, db=db, force_update=args.force_update))
+                index_page_info.child_pages.append(fetch_page_recursively(target_page_id, fs, html_template, db=db, force_update=args.force_update))
 
             if index_page_info:
                 # Create index file for this space
