@@ -99,7 +99,8 @@ class ConfluenceClient(object):
                 path_comp = urllib_parse.urlparse(redirect_url).path.split('/')
                 space_key, title = path_comp[-2:]
                 page = self.get_page_by_title(urllib_parse.unquote_plus(title), space_key=space_key)
-                page_id = page.page_id
+                # Page may not be found for the deleted case.
+                page_id = page and page.page_id
                 break
 
             if 'pageId' in redirect_url:
@@ -188,15 +189,12 @@ class ConfluenceDatabase(object):
                        (page.title, page.hash, page.space, page.mtime, page.page_id))
         self.conn.commit()
 
-    def upsert_page(self, page, force_update=False):
+    def upsert_page(self, page):
         page_tab = self.get_page_by_id(page.page_id)
         if not page_tab:
             self.insert_page(page)
-            return True
-        if page_tab and (page_tab.mtime < page.mtime or force_update):
-            self.update_page(page)
-            return True
-        return False
+            return
+        self.update_page(page)
 
 
 class FolderManager(object):
@@ -559,7 +557,9 @@ def fetch_page_recursively(page_id, fs, html_template, depth=0, db=None, force_u
     try:
         page, page_content = conf_client.get_page_details_by_page_id(page_id)
 
-        is_new_page = db.upsert_page(page, force_update=force_update)
+        page_db = db.get_page_by_id(page.page_id)
+        is_new_page = not page_db or page_db.mtime < page.mtime or force_update
+
         print('%sPAGE: %s (%s)' % ('\t' * (depth + 1), page.title, page_id), "SKIP" if not is_new_page else "")
 
         # Construct unique file name
@@ -568,7 +568,7 @@ def fetch_page_recursively(page_id, fs, html_template, depth=0, db=None, force_u
         # Remember this file and all children
         page_object = PageInfo(page, page_content, file_name)
 
-        if is_new_page or force_update:
+        if is_new_page:
             # Parse HTML
             html_tree = None
             try:
@@ -593,6 +593,9 @@ def fetch_page_recursively(page_id, fs, html_template, depth=0, db=None, force_u
 
             # Save another file with page id which forwards to the original one
             generate_id_reverse_file(fs, page, file_name, html_template)
+
+            # Update DB entry
+            db.upsert_page(page)
 
         # Iterate through all child pages
         for child_page in conf_client.iterate_child_pages_by_page_id(page_id):
