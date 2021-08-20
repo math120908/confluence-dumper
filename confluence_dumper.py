@@ -42,12 +42,12 @@ class ConfluenceClient(object):
         self.__cached_tinyurl = {}
 
     def get_page_details_by_page_id(self, page_id):
-        response = self.request('/rest/api/content/%s?expand=children.page,children.attachment,body.view.value,version' % page_id)
+        response = self.request('/rest/api/content/%s?expand=body.view.value,version,space' % page_id)
         return PageTab(
             page_id,
             response['title'],
-            None,
-            None,
+            response['_links']['tinyui'].split('/')[-1],
+            response['space']['key'],
             date_parser.parse(response['version']['when']),
         ), response['body']['view']['value']
 
@@ -56,11 +56,20 @@ class ConfluenceClient(object):
         return response['space']['key']
 
     def get_page_by_title(self, title, space_key=None):
-        params = {"title": title}
+        params = {"title": title, "expand": "version,space"}
         if space_key:
             params['spaceKey'] = space_key
         response = self.request('/rest/api/content?%s' % urllib_parse.urlencode(params))
-        return response['results'][0]['id'] if response['results'] else None
+        if not response['results']:
+            return None
+        rs = response['results'][0]
+        return PageTab(
+            rs['id'],
+            title,
+            rs['_links']['tinyui'].split('/')[-1],
+            rs['space']['key'],
+            date_parser.parse(rs['version']['when']),
+        )
 
     def get_homepage_info(self, space):
         response = self.request('/rest/api/space/%s?expand=homepage' % space)
@@ -89,7 +98,8 @@ class ConfluenceClient(object):
             if 'display' in redirect_url:
                 path_comp = urllib_parse.urlparse(redirect_url).path.split('/')
                 space_key, title = path_comp[-2:]
-                page_id = self.get_page_by_title(urllib_parse.unquote_plus(title), space_key=space_key)
+                page = self.get_page_by_title(urllib_parse.unquote_plus(title), space_key=space_key)
+                page_id = page.page_id
                 break
 
             if 'pageId' in redirect_url:
@@ -178,12 +188,12 @@ class ConfluenceDatabase(object):
                        (page.title, page.hash, page.space, page.mtime, page.page_id))
         self.conn.commit()
 
-    def upsert_page(self, page):
+    def upsert_page(self, page, force_update=False):
         page_tab = self.get_page_by_id(page.page_id)
         if not page_tab:
             self.insert_page(page)
             return True
-        if page_tab and page_tab.mtime < page.mtime:
+        if page_tab and (page_tab.mtime < page.mtime or force_update):
             self.update_page(page)
             return True
         return False
@@ -481,7 +491,7 @@ def download_temp_attachments_of_page(page_tree, download_folder, attachment_dup
 
 def fetch_page_recursively(page_id, folder_path, download_folder, html_template, depth=0,
                            page_duplicate_file_names=None, page_file_matching=None,
-                           attachment_duplicate_file_names=None, attachment_file_matching=None, db=None):
+                           attachment_duplicate_file_names=None, attachment_file_matching=None, db=None, force_update=False):
     """ Fetches a Confluence page and its child pages (with referenced downloads).
 
     :param page_id: Confluence page id.
@@ -509,7 +519,7 @@ def fetch_page_recursively(page_id, folder_path, download_folder, html_template,
     try:
         page, page_content = conf_client.get_page_details_by_page_id(page_id)
 
-        is_new_page = db.upsert_page(page)
+        is_new_page = db.upsert_page(page, force_update=force_update)
         print('%sPAGE: %s (%s)' % ('\t' * (depth + 1), page.title, page_id), "SKIP" if not is_new_page else "")
 
         # Construct unique file name
@@ -518,7 +528,7 @@ def fetch_page_recursively(page_id, folder_path, download_folder, html_template,
         # Remember this file and all children
         path_collection = PageInfo(file_path=file_name, page_title=page.title, child_pages=[], child_attachments=[])
 
-        if is_new_page:
+        if is_new_page or force_update:
             # Parse HTML
             html_tree = None
             try:
@@ -560,7 +570,7 @@ def fetch_page_recursively(page_id, folder_path, download_folder, html_template,
         for child_page in conf_client.iterate_child_pages_by_page_id(page_id):
             paths = fetch_page_recursively(child_page['id'], folder_path, download_folder, html_template,
                                            depth=depth + 1, page_duplicate_file_names=page_duplicate_file_names,
-                                           page_file_matching=page_file_matching, db=db)
+                                           page_file_matching=page_file_matching, db=db, force_update=force_update)
             if paths:
                 path_collection.child_pages.append(paths)
 
@@ -679,7 +689,7 @@ def main(args):
 
             index_page_info = PageInfo(file_path="", page_title="Index", child_pages=[], child_attachments=[])
             for target_page_id in target_page_ids:
-                index_page_info.child_pages.append(fetch_page_recursively(target_page_id, space_folder, download_folder, html_template, db=db))
+                index_page_info.child_pages.append(fetch_page_recursively(target_page_id, space_folder, download_folder, html_template, db=db, force_update=args.force_update))
 
             if index_page_info:
                 # Create index file for this space
@@ -700,6 +710,7 @@ def main(args):
 def parse_args():
     parser = argparse.ArgumentParser(description='Confluence dumps')
     parser.add_argument('--mode', dest="mode", choices=('space', 'page'), action='store')
+    parser.add_argument('--force', dest="force_update", default=False, action="store_true")
 
     return parser.parse_args()
 
