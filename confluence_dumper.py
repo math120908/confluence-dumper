@@ -261,7 +261,39 @@ class SpaceFileSystem(object):
 
 PageTab = namedtuple("PageTab", ['page_id', 'title', 'hash', 'space', 'mtime'])
 
-PageInfo = namedtuple('PageInfo', ['file_path', 'page_title', 'child_pages', 'child_attachments'])
+
+class PageInfo(object):
+    def __init__(self, page, page_content, file_path):
+        self.page = page  # type: PageTab
+        self.page_content = page_content  # type: str
+        self.file_path = file_path  # type: str
+        self.child_pages = []
+        self.child_attachments = []
+
+    def append_child_page(self, page):
+        if page:
+            self.child_pages.append(page)
+
+    def extend_attachments(self, attachments):
+        self.child_attachments.extend(attachments)
+
+    def generate_index_content(self, html_template, is_root=False):
+        """ Creates an HTML index (mainly to navigate through the exported pages).
+
+        :returns: Content index as HTML.
+        """
+        file_path = utils.encode_url(self.file_path)
+
+        html_content = '<a href="%s">%s</a>' % (utils.sanitize_for_filename(file_path), "Index" if is_root else self.page.title)
+
+        if len(self.child_pages) > 0:
+            html_content += '<ul>\n'
+            for child in self.child_pages:
+                html_content += '\t<li>%s</li>\n' % child.generate_index_content(html_template)
+            html_content += '</ul>\n'
+
+        return html_content
+
 
 conf_client = ConfluenceClient(settings.CONFLUENCE_BASE_URL)
 
@@ -383,6 +415,22 @@ def handle_html_references(html_tree, fs, depth=0):
     return html.tostring(html_tree)
 
 
+def generate_id_reverse_file(fs, page, file_name, html_template):
+    """ Save another file with page id which forwards to the original one
+    :param SpaceFileSystem fs:
+    :param PageTab page:
+    :param str file_name:
+    :param str html_template:
+    :return:
+    """
+    id_file_path = fs.get_id_file_path(page.page_id)
+    id_file_page_title = 'Forward to page %s' % page.title
+    original_file_link = utils.encode_url(utils.sanitize_for_filename(file_name))
+    id_file_page_content = settings.HTML_FORWARD_MESSAGE % (original_file_link, page.title)
+    id_file_forward_header = '<meta http-equiv="refresh" content="0; url=%s" />' % original_file_link
+    utils.write_html_2_file(id_file_path, id_file_page_title, id_file_page_content, html_template, additional_headers=[id_file_forward_header])
+
+
 def download_file(clean_url, download_folder, downloaded_file_name, depth=0, error_output=True):
     """ Downloads a specific file.
 
@@ -502,6 +550,8 @@ def fetch_page_recursively(page_id, fs, html_template, depth=0, db=None, force_u
     :param SpaceFileSystem fs:
     :param html_template: HTML template used to export Confluence pages.
     :param depth: (optional) Hierarchy depth of the handled Confluence page.
+    :param ConfluenceDatabase db:
+    :param bool force_update:
     :rtype: PageInfo
     :returns: Information about downloaded files (pages, attachments, images, ...) as a PageInfo (None for exceptions)
     """
@@ -516,7 +566,7 @@ def fetch_page_recursively(page_id, fs, html_template, depth=0, db=None, force_u
         file_name = fs.page_folder_manager.provide_unique_filename(page.title, explicit_file_extension='html')
 
         # Remember this file and all children
-        path_collection = PageInfo(file_path=file_name, page_title=page.title, child_pages=[], child_attachments=[])
+        page_object = PageInfo(page, page_content, file_name)
 
         if is_new_page or force_update:
             # Parse HTML
@@ -527,64 +577,33 @@ def fetch_page_recursively(page_id, fs, html_template, depth=0, db=None, force_u
                 print('%sWARNING: Could not parse HTML content of last page. Original content will be downloaded as it is.' % ('\t' * (depth + 1)))
 
             # Download attachments of this page
-            path_collection.child_attachments.extend(download_attachments_of_page(
-                page_id,
-                fs.download_folder_manager,
-                depth=depth + 1,
-            ))
-            path_collection.child_attachments.extend(download_temp_attachments_of_page(
-                html_tree,
-                fs.download_folder_manager,
-                depth=depth + 1,
-            ))
+            page_object.extend_attachments(
+                download_attachments_of_page(page_id, fs.download_folder_manager, depth=depth + 1)
+            )
+            page_object.extend_attachments(
+                download_temp_attachments_of_page(html_tree, fs.download_folder_manager, depth=depth + 1)
+            )
             # Export HTML file
             if html_tree is not None:
                 page_content = handle_html_references(html_tree, fs, depth + 1)
 
             file_path = fs.get_file_path(file_name)
-            page_content += create_html_attachment_index(path_collection.child_attachments)
+            page_content += create_html_attachment_index(page_object.child_attachments)
             utils.write_html_2_file(file_path, page.title, page_content, html_template)
 
             # Save another file with page id which forwards to the original one
-            id_file_path = fs.get_id_file_path(page_id)
-            id_file_page_title = 'Forward to page %s' % page.title
-            original_file_link = utils.encode_url(utils.sanitize_for_filename(file_name))
-            id_file_page_content = settings.HTML_FORWARD_MESSAGE % (original_file_link, page.title)
-            id_file_forward_header = '<meta http-equiv="refresh" content="0; url=%s" />' % original_file_link
-            utils.write_html_2_file(id_file_path, id_file_page_title, id_file_page_content, html_template, additional_headers=[id_file_forward_header])
+            generate_id_reverse_file(fs, page, file_name, html_template)
 
         # Iterate through all child pages
         for child_page in conf_client.iterate_child_pages_by_page_id(page_id):
-            paths = fetch_page_recursively(child_page['id'], fs, html_template, depth=depth + 1, db=db, force_update=force_update)
-            if paths:
-                path_collection.child_pages.append(paths)
+            child_page_obj = fetch_page_recursively(child_page['id'], fs, html_template, depth=depth + 1, db=db, force_update=force_update)
+            page_object.append_child_page(child_page_obj)
 
-        return path_collection
+        return page_object
 
     except utils.ConfluenceException as e:
         error_print('%sERROR: %s' % ('\t' * (depth + 1), e))
         return None
-
-
-def create_html_index(index_content):
-    """ Creates an HTML index (mainly to navigate through the exported pages).
-
-    :param PageInfo index_content: PageInfo contains file paths, page titles and their children recursively.
-    :returns: Content index as HTML.
-    """
-    file_path = utils.encode_url(index_content.file_path)
-    page_title = index_content.page_title
-    page_children = index_content.child_pages
-
-    html_content = '<a href="%s">%s</a>' % (utils.sanitize_for_filename(file_path), page_title)
-
-    if len(page_children) > 0:
-        html_content += '<ul>\n'
-        for child in page_children:
-            html_content += '\t<li>%s</li>\n' % create_html_index(child)
-        html_content += '</ul>\n'
-
-    return html_content
 
 
 def print_welcome_output():
@@ -670,16 +689,16 @@ def main(args):
             if target_page_ids is None:
                 target_page_ids = [space_page_id]
 
-            index_page_info = PageInfo(file_path="", page_title="Index", child_pages=[], child_attachments=[])
+            index_page_info = PageInfo(None, "", "")
             for target_page_id in target_page_ids:
-                index_page_info.child_pages.append(fetch_page_recursively(target_page_id, fs, html_template, db=db, force_update=args.force_update))
+                index_page_info.append_child_page(fetch_page_recursively(target_page_id, fs, html_template, db=db, force_update=args.force_update))
 
-            if index_page_info:
-                # Create index file for this space
-                space_index_path = '%s/index.html' % space_folder
-                space_index_title = 'Index of Space %s (%s)' % (space_name, space)
-                space_index_content = create_html_index(index_page_info)
-                utils.write_html_2_file(space_index_path, space_index_title, space_index_content, html_template)
+            # Create index file for this space
+            space_index_path = '%s/index.html' % space_folder
+            space_index_title = 'Index of Space %s (%s)' % (space_name, space)
+            space_index_content = index_page_info.generate_index_content(html_template, is_root=True)
+            utils.write_html_2_file(space_index_path, space_index_title, space_index_content, html_template)
+
         except utils.ConfluenceException as e:
             error_print('ERROR: %s' % e)
         except OSError:
