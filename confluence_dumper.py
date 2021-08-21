@@ -230,6 +230,7 @@ class FolderManager(object):
                 file_name, file_extension = file_name.rsplit('.', 1)
             else:
                 file_extension = None
+        file_name = file_name[:60]  # trim filename
 
         if file_name in self.duplicate_filenames:
             self.duplicate_filenames[file_name] += 1
