@@ -320,20 +320,24 @@ def derive_downloaded_file_name(download_url):
     :returns: Derived file name; if derivation is not possible, None is returned.
     """
     download_url = urllib_parse.urlparse(download_url).path  # Only retain path part
-    if '/download/temp/' in download_url:
-        return 'temp_%s' % download_url.split('/')[-1]
 
-    elif '/download/' in download_url:
-        download_url_parts = download_url.split('/')
-        download_page_id = download_url_parts[3]
-        download_file_type = download_url_parts[2]
-        download_original_file_name = download_url_parts[-1]
+    try:
+        if '/download/temp/' in download_url:
+            return 'temp_%s' % download_url.split('/')[-1]
 
-        return '%s_%s_%s' % (download_page_id, download_file_type, download_original_file_name)
-    elif '/rest/documentConversion/latest/conversion/thumbnail/' in download_url:
-        file_id = download_url.split('/rest/documentConversion/latest/conversion/thumbnail/')[1][0:-2]
-        return 'generated_preview_%s.jpg' % file_id
-    else:
+        elif '/download/' in download_url:
+            download_url_parts = download_url.split('/')
+            download_page_id = download_url_parts[3]
+            download_file_type = download_url_parts[2]
+            download_original_file_name = download_url_parts[-1]
+
+            return '%s_%s_%s' % (download_page_id, download_file_type, download_original_file_name)
+        elif '/rest/documentConversion/latest/conversion/thumbnail/' in download_url:
+            file_id = download_url.split('/rest/documentConversion/latest/conversion/thumbnail/')[1][0:-2]
+            return 'generated_preview_%s.jpg' % file_id
+        else:
+            return None
+    except:
         return None
 
 
@@ -444,7 +448,7 @@ def download_file(clean_url, download_folder, downloaded_file_name, depth=0, err
 
     # Download file if it does not exist yet
     if not os.path.exists(downloaded_file_path):
-        absolute_download_url = '%s%s' % (settings.CONFLUENCE_BASE_URL, clean_url)
+        absolute_download_url = urllib_parse.urljoin(settings.CONFLUENCE_BASE_URL, clean_url)
         print('%sDOWNLOAD: %s' % ('\t' * (depth + 1), downloaded_file_name))
         try:
             utils.http_download_binary_file(absolute_download_url, downloaded_file_path,
@@ -542,72 +546,88 @@ def download_temp_attachments_of_page(page_tree, download_fm, depth):
     return child_attachments
 
 
-def fetch_page_recursively(page_id, fs, html_template, depth=0, db=None, force_update=False):
-    """ Fetches a Confluence page and its child pages (with referenced downloads).
+class PageDownloader(object):
+    def __init__(self, fs, html_template, db=None, force_update=False, max_depth=None):
+        """
 
-    :param page_id: Confluence page id.
-    :param SpaceFileSystem fs:
-    :param html_template: HTML template used to export Confluence pages.
-    :param depth: (optional) Hierarchy depth of the handled Confluence page.
-    :param ConfluenceDatabase db:
-    :param bool force_update:
-    :rtype: PageInfo
-    :returns: Information about downloaded files (pages, attachments, images, ...) as a PageInfo (None for exceptions)
-    """
+        :param SpaceFileSystem fs:
+        :param html_template: HTML template used to export Confluence pages.
+        :param ConfluenceDatabase db:
+        :param bool force_update:
+        """
+        self.fs = fs
+        self.html_template = html_template
+        self.db = db
+        self.force_update = force_update
+        self.max_depth = max_depth
 
-    try:
-        page, page_content = conf_client.get_page_details_by_page_id(page_id)
+    def fetch_page_recursively(self, page_id, depth=0):
+        """ Fetches a Confluence page and its child pages (with referenced downloads).
 
-        page_db = db.get_page_by_id(page.page_id)
-        is_new_page = not page_db or page_db.mtime < page.mtime or force_update
+        :param depth: (optional) Hierarchy depth of the handled Confluence page.
+        :param page_id: Confluence page id.
+        :rtype: PageInfo
+        :returns: Information about downloaded files (pages, attachments, images, ...) as a PageInfo (None for exceptions)
+        """
+        if self.max_depth and depth >= self.max_depth:
+            return
+        if int(page_id) in settings.SKIP_PAGES:
+            return
 
-        print('%sPAGE: %s (%s)' % ('\t' * (depth + 1), page.title, page_id), "SKIP" if not is_new_page else "")
+        try:
+            page, page_content = conf_client.get_page_details_by_page_id(page_id)
 
-        # Construct unique file name
-        file_name = fs.page_folder_manager.provide_unique_filename(page.title, explicit_file_extension='html')
+            page_db = self.db.get_page_by_id(page.page_id)
+            is_new_page = not page_db or page_db.mtime < page.mtime or self.force_update
 
-        # Remember this file and all children
-        page_object = PageInfo(page, page_content, file_name)
+            print('%sPAGE: %s (%s)' % ('\t' * (depth + 1), page.title, page_id), "SKIP" if not is_new_page else "")
 
-        if is_new_page:
-            # Parse HTML
-            html_tree = None
-            try:
-                html_tree = parse_html_tree(page_content)
-            except XMLSyntaxError:
-                print('%sWARNING: Could not parse HTML content of last page. Original content will be downloaded as it is.' % ('\t' * (depth + 1)))
+            # Construct unique file name
+            file_name = self.fs.page_folder_manager.provide_unique_filename(page.title, explicit_file_extension='html')
 
-            # Download attachments of this page
-            page_object.extend_attachments(
-                download_attachments_of_page(page_id, fs.download_folder_manager, depth=depth + 1)
-            )
-            page_object.extend_attachments(
-                download_temp_attachments_of_page(html_tree, fs.download_folder_manager, depth=depth + 1)
-            )
-            # Export HTML file
-            if html_tree is not None:
-                page_content = handle_html_references(html_tree, fs, depth + 1)
+            # Remember this file and all children
+            page_object = PageInfo(page, page_content, file_name)
 
-            file_path = fs.get_file_path(file_name)
-            page_content += create_html_attachment_index(page_object.child_attachments)
-            utils.write_html_2_file(file_path, page.title, page_content, html_template)
+            if is_new_page:
+                # Parse HTML
+                html_tree = None
+                try:
+                    html_tree = parse_html_tree(page_content)
+                except XMLSyntaxError:
+                    print('%sWARNING: Could not parse HTML content of last page. Original content will be downloaded as it is.' % ('\t' * (depth + 1)))
 
-            # Save another file with page id which forwards to the original one
-            generate_id_reverse_file(fs, page, file_name, html_template)
+                # Download attachments of this page
+                page_object.extend_attachments(
+                    download_attachments_of_page(page_id, self.fs.download_folder_manager, depth=depth + 1)
+                )
+                page_object.extend_attachments(
+                    download_temp_attachments_of_page(html_tree, self.fs.download_folder_manager, depth=depth + 1)
+                )
+                # Export HTML file
+                if html_tree is not None:
+                    page_content = handle_html_references(html_tree, self.fs, depth + 1)
 
-            # Update DB entry
-            db.upsert_page(page)
+                file_path = self.fs.get_file_path(file_name)
+                page_content += create_html_attachment_index(page_object.child_attachments)
+                utils.write_html_2_file(file_path, page.title, page_content, self.html_template)
 
-        # Iterate through all child pages
-        for child_page in conf_client.iterate_child_pages_by_page_id(page_id):
-            child_page_obj = fetch_page_recursively(child_page['id'], fs, html_template, depth=depth + 1, db=db, force_update=force_update)
-            page_object.append_child_page(child_page_obj)
+                # Save another file with page id which forwards to the original one
+                generate_id_reverse_file(self.fs, page, file_name, self.html_template)
 
-        return page_object
+                # Update DB entry
+                self.db.upsert_page(page)
 
-    except utils.ConfluenceException as e:
-        error_print('%sERROR: %s' % ('\t' * (depth + 1), e))
-        return None
+            # Iterate through all child pages
+            for child_page in conf_client.iterate_child_pages_by_page_id(page_id):
+                child_page_obj = self.fetch_page_recursively(child_page['id'], depth=depth + 1)
+                if child_page_obj:
+                    page_object.append_child_page(child_page_obj)
+
+            return page_object
+
+        except utils.ConfluenceException as e:
+            error_print('%sERROR: %s' % ('\t' * (depth + 1), e))
+            return None
 
 
 def print_welcome_output():
@@ -694,8 +714,9 @@ def main(args):
                 target_page_ids = [space_page_id]
 
             index_page_info = PageInfo(None, "", "")
+            downloader = PageDownloader(fs=fs, html_template=html_template, db=db, force_update=args.force_update, max_depth=args.max_depth)
             for target_page_id in target_page_ids:
-                index_page_info.append_child_page(fetch_page_recursively(target_page_id, fs, html_template, db=db, force_update=args.force_update))
+                index_page_info.append_child_page(downloader.fetch_page_recursively(target_page_id))
 
             # Create index file for this space
             space_index_path = '%s/index.html' % space_folder
@@ -717,6 +738,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Confluence dumps')
     parser.add_argument('--mode', dest="mode", choices=('space', 'page'), action='store')
     parser.add_argument('--force', dest="force_update", default=False, action="store_true")
+    parser.add_argument('--max-depth', dest="max_depth", default=None, type=int, action="store")
 
     return parser.parse_args()
 
