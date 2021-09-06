@@ -42,13 +42,14 @@ class ConfluenceClient(object):
         self.__cached_tinyurl = {}
 
     def get_page_details_by_page_id(self, page_id):
-        response = self.request('/rest/api/content/%s?expand=body.view.value,version,space' % page_id)
+        response = self.request('/rest/api/content/%s?expand=body.view.value,version,space,ancestors' % page_id)
         return PageTab(
             page_id,
             response['title'],
             response['_links']['tinyui'].split('/')[-1],
             response['space']['key'],
             date_parser.parse(response['version']['when']),
+            response['ancestors'][-1]['id'] if response.get('ancestors') else None
         ), response['body']['view']['value']
 
     def get_page_space_by_page_id(self, page_id):
@@ -69,6 +70,7 @@ class ConfluenceClient(object):
             rs['_links']['tinyui'].split('/')[-1],
             rs['space']['key'],
             date_parser.parse(rs['version']['when']),
+            None,
         )
 
     def get_homepage_info(self, space):
@@ -162,7 +164,8 @@ class ConfluenceDatabase(object):
             title varchar,
             hash varchar,
             space varchar,
-            mtime date
+            mtime date,
+            parent_id integer
         );
         CREATE INDEX IF NOT EXISTS page_hash_idx ON page_tab(hash);
         """)
@@ -172,7 +175,7 @@ class ConfluenceDatabase(object):
         cursor = self.conn.cursor()
         cursor.execute("select * from page_tab where page_id = ?;", (page_id,))
         rs = cursor.fetchone()
-        return PageTab(rs[0], rs[1], rs[2], rs[3], date_parser.parse(rs[4])) if rs else None
+        return PageTab(rs[0], rs[1], rs[2], rs[3], date_parser.parse(rs[4]), rs[5]) if rs else None
 
     def insert_page(self, page):
         """
@@ -180,13 +183,13 @@ class ConfluenceDatabase(object):
         :return:
         """
         cursor = self.conn.cursor()
-        cursor.execute("Insert into page_tab values (?, ?, ?, ?, ?)", (page.page_id, page.title, page.hash, page.space, page.mtime))
+        cursor.execute("Insert into page_tab values (?, ?, ?, ?, ?, ?)", (page.page_id, page.title, page.hash, page.space, page.mtime, page.parent_id))
         self.conn.commit()
 
     def update_page(self, page):
         cursor = self.conn.cursor()
-        cursor.execute("Update page_tab SET title = ?, hash = ?, space= ?, mtime = ? WHERE page_id = ?",
-                       (page.title, page.hash, page.space, page.mtime, page.page_id))
+        cursor.execute("Update page_tab SET title = ?, hash = ?, space= ?, mtime = ?, parent_id = ? WHERE page_id = ?",
+                       (page.title, page.hash, page.space, page.mtime, page.parent_id, page.page_id))
         self.conn.commit()
 
     def upsert_page(self, page):
@@ -258,7 +261,7 @@ class SpaceFileSystem(object):
         return '%s/%s.html' % (self.page_folder_manager.folder, page_id)
 
 
-PageTab = namedtuple("PageTab", ['page_id', 'title', 'hash', 'space', 'mtime'])
+PageTab = namedtuple("PageTab", ['page_id', 'title', 'hash', 'space', 'mtime', 'parent_id'])
 
 
 class PageInfo(object):
@@ -616,6 +619,8 @@ class PageDownloader(object):
 
                 # Update DB entry
                 self.db.upsert_page(page)
+            elif page_db.parent_id is None and page.parent_id:
+                self.db.upsert_page(page)
 
             # Iterate through all child pages
             for child_page in conf_client.iterate_child_pages_by_page_id(page_id):
@@ -691,7 +696,7 @@ def main(args):
     # Fetch all spaces if spaces were not configured via settings
     spaces_pages_to_export = convert_space_pages_to_export(args.mode)
 
-    db = ConfluenceDatabase("conf.db")
+    db = ConfluenceDatabase("conf.sqlite")
 
     print('Exporting %d space(s): %s\n' % (len(spaces_pages_to_export), ', '.join(spaces_pages_to_export)))
 
